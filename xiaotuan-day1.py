@@ -58,7 +58,6 @@ class Race:
         self.max_rounds = max_rounds
 
         # 西格莉卡技能默认从第2回合开始生效：
-        # 因为你给的文本中有“比赛中首次投骰子仅决定行动顺序”
         self.sigelika_mark_from_round = sigelika_mark_from_round
 
         self.racers = [Tuanzi(name=name) for name in NORMAL_NAMES]
