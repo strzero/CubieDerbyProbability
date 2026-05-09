@@ -1,20 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-鸣潮「小团快跑」Day2 胜率模拟器
+鸣潮「小团快跑」下半场胜率模拟器
 
 当前规则版本：
-1. 棋盘共32格，起点第1格，终点第32格。
-2. 普通团子顺时针移动：1 -> 2 -> ... -> 32。
+1. 下半场初始位置以上半场结束位置为准。
+2. 普通团子顺时针移动：1 -> 2 -> ... -> 32 -> 1 -> ...
 3. 布大王逆时针移动：32 -> 31 -> ... -> 1 -> 32。
-4. 普通团子行动点数为1~3。
-5. 布大王行动点数为1~6。
-6. Day2 第一回合固定行动顺序：
-   达妮娅 -> 菲比 -> 西格莉卡 -> 绯雪 -> 陆赫斯 -> 卡提西娅
-7. 第二回合开始，每回合行动顺序随机决定。
-8. 布大王第3回合开始加入行动顺序。
-9. 西格莉卡技能第2回合开始生成标记。
-10. 地图装置支持连锁触发。
-11. 输出夺冠率与晋级率。
+4. 普通团子行动点数为 1~3。
+5. 布大王行动点数为 1~6。
+6. 每回合行动顺序随机决定。
+7. 布大王第3回合开始加入行动顺序。
+8. 西格莉卡技能第2回合开始生成标记。
+9. 地图装置支持连锁触发。
+10. 下半场以“第二次到达32格”的团子为胜者。
 """
 
 from __future__ import annotations
@@ -28,6 +26,7 @@ from collections import Counter
 BOARD_SIZE = 32
 START_POS = 1
 FINISH_POS = 32
+TARGET_ARRIVALS = 2
 
 NORMAL_DICE_MIN = 1
 NORMAL_DICE_MAX = 3
@@ -36,23 +35,44 @@ BUWANG_DICE_MIN = 1
 BUWANG_DICE_MAX = 6
 
 SIGELIKA_START_ROUND = 2
+BUWANG_START_ROUND = 3
 
 BOOST_CELLS = {3, 11, 16, 23}
 BLOCK_CELLS = {10, 28}
 RIFT_CELLS = {6, 20}
 
 NORMAL_NAMES = ["陆赫斯", "西格莉卡", "达妮娅", "绯雪", "卡提西娅", "菲比"]
-
-DAY2_FIRST_ROUND_ORDER = [
-    "达妮娅",
-    "菲比",
-    "西格莉卡",
-    "绯雪",
-    "陆赫斯",
-    "卡提西娅",
-]
-
 BUWANG_NAME = "布大王"
+
+
+# 下半场初始棋盘。
+# 列表顺序表示“从上到下”的同格顺序。
+INITIAL_STACKS = {
+    32: ["达妮娅"],
+    31: ["菲比", "西格莉卡"],
+    30: ["绯雪", "陆赫斯"],
+    29: ["卡提西娅"],
+}
+
+
+# 下半场“到达32格”计数。
+# 达妮娅当前已经在32格，因此视为已经到达过1次。
+# 其他团子尚未到达本圈终点，计为0。
+INITIAL_ARRIVALS = {name: 0 for name in NORMAL_NAMES}
+INITIAL_ARRIVALS["达妮娅"] = 1
+
+
+# 若下半场第一回合也有固定行动顺序，可以在这里填入列表。
+# 保持 None 时，第一回合也随机。
+FIRST_ROUND_ORDER = None
+# FIRST_ROUND_ORDER = ["卡提西娅", "陆赫斯", "绯雪", "西格莉卡", "菲比", "达妮娅"]
+
+
+# 若上半场遗留技能状态已知，可以在这里修改。
+INITIAL_DANIYA_LAST_DICE = None
+INITIAL_FEIXUE_BUFF = False
+INITIAL_KATI_TRIGGERED = False
+INITIAL_KATI_ACTIVE = False
 
 
 @dataclass
@@ -68,16 +88,23 @@ class Tuanzi:
     kati_triggered: bool = False
     kati_active: bool = False
 
-    has_left_start: bool = False
+    has_left_start: bool = True
 
 
 class Race:
-    def __init__(self, rng: Random, max_rounds: int = 300):
+    def __init__(self, rng: Random, max_rounds: int = 500):
         self.rng = rng
         self.max_rounds = max_rounds
         self.round_no = 0
+        self.race_over = False
 
         self.racers = [Tuanzi(name=name) for name in NORMAL_NAMES]
+        self.name_to_racer = {x.name: x for x in self.racers}
+
+        self.name_to_racer["达妮娅"].last_dice = INITIAL_DANIYA_LAST_DICE
+        self.name_to_racer["绯雪"].feixue_buff = INITIAL_FEIXUE_BUFF
+        self.name_to_racer["卡提西娅"].kati_triggered = INITIAL_KATI_TRIGGERED
+        self.name_to_racer["卡提西娅"].kati_active = INITIAL_KATI_ACTIVE
 
         self.buwang = Tuanzi(
             name=BUWANG_NAME,
@@ -85,33 +112,27 @@ class Race:
             is_buwang=True,
             has_left_start=True,
         )
-
         self.buwang_on_board = False
+
+        self.arrivals = dict(INITIAL_ARRIVALS)
 
         self.cells: dict[int, list[Tuanzi]] = {
             i: [] for i in range(START_POS, FINISH_POS + 1)
         }
 
-        # 所有普通团子从第1格出发。
-        # 第1格初始不计算同格状态，所以第一次从起点行动时不会带走其他团子。
-        init_order = self.racers[:]
-        self.rng.shuffle(init_order)
-        self.cells[START_POS] = init_order
+        self.init_board_from_half_time()
 
-        for racer in self.racers:
-            racer.pos = START_POS
-
-    def clamp_normal_pos(self, pos: int) -> int:
-        """
-        普通团子顺时针前进，到达或超过32时停在32。
-        """
-        return max(START_POS, min(FINISH_POS, pos))
+    def init_board_from_half_time(self) -> None:
+        for pos, names in INITIAL_STACKS.items():
+            stack = []
+            for name in names:
+                racer = self.name_to_racer[name]
+                racer.pos = pos
+                racer.has_left_start = True
+                stack.append(racer)
+            self.cells[pos] = stack
 
     def wrap_pos(self, pos: int) -> int:
-        """
-        环形坐标换算。
-        1之前是32，32之后是1。
-        """
         return ((pos - 1) % BOARD_SIZE) + 1
 
     def get_cell(self, pos: int) -> list[Tuanzi]:
@@ -120,12 +141,7 @@ class Race:
     def enforce_buwang_bottom(self, pos: int) -> None:
         """
         布大王锁定同格顺序 n=999。
-
-        本脚本中：
-        stack[0] 表示 n=1，即最上方；
-        stack[-1] 表示最下方。
-
-        因此布大王永远放在该格最下方。
+        stack[0] 是最上方，stack[-1] 是最下方。
         """
         stack = self.get_cell(pos)
         normals = [x for x in stack if not x.is_buwang]
@@ -142,120 +158,132 @@ class Race:
     def add_group_to_cell(self, pos: int, group: list[Tuanzi]) -> None:
         """
         新进入该格的团子放在原有团子上方。
-        也就是新进入者同格顺序 n 更小。
         """
         old_stack = self.get_cell(pos)
         self.cells[pos] = group + old_stack
 
         for x in group:
             x.pos = pos
-            if not x.is_buwang and pos != START_POS:
+            if not x.is_buwang:
                 x.has_left_start = True
 
         self.enforce_buwang_bottom(pos)
 
-    def move_group_normal_path(self, group: list[Tuanzi], delta: int) -> None:
+    def record_arrival_if_needed(self, pos: int, group: list[Tuanzi]) -> bool:
         """
-        普通团子的顺时针移动：
-        1 -> 2 -> 3 -> ... -> 32
+        普通团子进入32格时，到达次数+1。
+        达到第二次到达32格时，本场结束。
+        """
+        if pos != FINISH_POS:
+            return False
 
-        普通团子不会越过终点，超过32视为到达32。
+        has_winner = False
+
+        for x in group:
+            if x.is_buwang:
+                continue
+
+            self.arrivals[x.name] += 1
+
+            if self.arrivals[x.name] >= TARGET_ARRIVALS:
+                has_winner = True
+
+        return has_winner
+
+    def move_group_normal_path(self, group: list[Tuanzi], delta: int) -> bool:
+        """
+        普通团子顺时针移动。
+        delta > 0 表示前进，delta < 0 表示后退。
+        """
+        return self.move_group_stepwise(group, delta=delta, path="normal")
+
+    def move_group_buwang_path(self, group: list[Tuanzi], delta: int) -> bool:
+        """
+        布大王逆时针移动。
+        delta > 0 表示布大王前进，格号减少。
+        """
+        return self.move_group_stepwise(group, delta=delta, path="buwang")
+
+    def move_group_stepwise(self, group: list[Tuanzi], delta: int, path: str) -> bool:
+        """
+        逐格移动。
+        这样可以统计移动过程中是否经过32格。
         """
         if not group or delta == 0:
-            return
+            return False
 
         old_pos = group[0].pos
         self.remove_group_from_cell(old_pos, group)
 
-        new_pos = self.clamp_normal_pos(old_pos + delta)
-        self.add_group_to_cell(new_pos, group)
+        current = old_pos
+        step_count = abs(delta)
+        sign = 1 if delta > 0 else -1
 
-    def move_group_buwang_path(self, group: list[Tuanzi], delta: int) -> None:
-        """
-        布大王的逆时针移动：
-        32 -> 31 -> 30 -> ... -> 2 -> 1 -> 32
+        for _ in range(step_count):
+            if path == "normal":
+                current = self.wrap_pos(current + sign)
+            elif path == "buwang":
+                current = self.wrap_pos(current - sign)
+            else:
+                raise ValueError(f"未知路径类型：{path}")
 
-        如果布大王行动时带着普通团子一起移动，
-        被带走的普通团子也跟随布大王沿逆时针方向移动。
-        """
-        if not group or delta == 0:
-            return
+            if self.record_arrival_if_needed(current, group):
+                self.add_group_to_cell(current, group)
+                self.race_over = True
+                return True
 
-        old_pos = group[0].pos
-        self.remove_group_from_cell(old_pos, group)
-
-        # 布大王“前进”时，格号减少。
-        new_pos = self.wrap_pos(old_pos - delta)
-        self.add_group_to_cell(new_pos, group)
+        self.add_group_to_cell(current, group)
+        return False
 
     def moving_group_for_actor(self, actor: Tuanzi) -> list[Tuanzi]:
         """
         同格移动规则：
-
-        stack[0] 是 n=1，最上方。
-        stack[1] 是 n=2。
-        依此类推。
-
-        如果行动者位于 stack[i]，
-        则 stack[:i+1] 跟随行动者一起移动。
-
-        布大王 n=999，始终位于最下方。
-        因此布大王行动时，会带走该格所有普通团子；
-        普通团子行动时，不会带走布大王。
+        行动团子及其上方团子一起行动。
         """
         stack = self.get_cell(actor.pos)
-
-        # 起点初始不计算同格状态。
-        if (
-            not actor.is_buwang
-            and actor.pos == START_POS
-            and not actor.has_left_start
-        ):
-            return [actor]
-
         idx = stack.index(actor)
         return stack[: idx + 1]
 
     def ranking(self) -> list[Tuanzi]:
         """
-        普通团子排名：
-        1. 位置越靠近终点，排名越高。
-        2. 同格时，同格顺序 n 越小，排名越高。
-        3. 布大王不参与普通团子排名。
+        下半场排名：
+        1. 到达32格次数更多者更靠前。
+        2. 次数相同，当前位置越接近32越靠前。
+        3. 同格时，同格顺序越靠上越靠前。
         """
-        result: list[Tuanzi] = []
+        entries = []
 
-        for pos in range(FINISH_POS, START_POS - 1, -1):
-            for x in self.get_cell(pos):
-                if not x.is_buwang:
-                    result.append(x)
+        for pos in range(START_POS, FINISH_POS + 1):
+            for stack_index, x in enumerate(self.get_cell(pos)):
+                if x.is_buwang:
+                    continue
+                entries.append((x, self.arrivals[x.name], pos, stack_index))
 
-        return result
+        entries.sort(key=lambda item: (-item[1], -item[2], item[3]))
+
+        return [x for x, _arrivals, _pos, _stack_index in entries]
 
     def action_order(self, participants: list[Tuanzi]) -> list[Tuanzi]:
         """
-        Day2 特殊规则：
-        第一回合固定出击顺序。
-
-        从第二回合开始：
-        每回合行动顺序随机决定。
+        默认每回合行动顺序随机。
+        若 FIRST_ROUND_ORDER 不为 None，则第一回合使用固定顺序。
         """
-        if self.round_no == 1:
+        if self.round_no == 1 and FIRST_ROUND_ORDER:
             name_to_actor = {x.name: x for x in participants}
-            fixed_order = [
+
+            fixed = [
                 name_to_actor[name]
-                for name in DAY2_FIRST_ROUND_ORDER
+                for name in FIRST_ROUND_ORDER
                 if name in name_to_actor
             ]
 
-            # 保险处理：如果参与者中有未写入固定顺序的对象，则随机接在后面。
             remaining = [
                 x for x in participants
-                if x.name not in DAY2_FIRST_ROUND_ORDER
+                if x.name not in FIRST_ROUND_ORDER
             ]
-            self.rng.shuffle(remaining)
 
-            return fixed_order + remaining
+            self.rng.shuffle(remaining)
+            return fixed + remaining
 
         order = participants[:]
         self.rng.shuffle(order)
@@ -264,12 +292,10 @@ class Race:
     def sigelika_targets(self) -> set[str]:
         """
         西格莉卡：
-        从第2回合开始，标记排名紧邻自身且更高的至多两个团子。
-
-        被标记团子本回合移动距离 -1，最低为1。
+        第2回合开始，标记排名紧邻自身且更高的至多两个团子。
         """
         rank = self.ranking()
-        sigelika = next(x for x in self.racers if x.name == "西格莉卡")
+        sigelika = self.name_to_racer["西格莉卡"]
 
         idx = rank.index(sigelika)
         higher = rank[max(0, idx - 2): idx]
@@ -279,13 +305,8 @@ class Race:
     def actor_steps(self, actor: Tuanzi, round_debuff: set[str]) -> int:
         """
         计算本次行动点数。
-
-        普通团子：
-        行动点数 1~3。
-
-        布大王：
-        行动点数 1~6。
-        方向不在这里处理，而是在 move_group_buwang_path 中处理。
+        普通团子：1~3
+        布大王：1~6
         """
         if actor.is_buwang:
             return self.rng.randint(BUWANG_DICE_MIN, BUWANG_DICE_MAX)
@@ -310,45 +331,26 @@ class Race:
             if self.rng.random() < 0.50:
                 steps += 1
 
-        # 西格莉卡减速，最低移动距离为1。
         if actor.name in round_debuff:
             steps = max(1, steps - 1)
 
         return steps
 
-    def resolve_devices_chain(
-        self,
-        group: list[Tuanzi],
-        use_buwang_path: bool,
-    ) -> None:
+    def resolve_devices_chain(self, group: list[Tuanzi], use_buwang_path: bool) -> bool:
         """
         地图装置连锁触发。
 
-        推进装置：
-        第3、11、16、23格。
-        普通效果：沿当前行动方向前进1格。
-        如果移动组中包含陆赫斯，则额外前进3格。
-
-        阻遏装置：
-        第10、28格。
-        普通效果：沿当前行动方向后退1格。
-        如果移动组中包含陆赫斯，则额外后退1格。
-
-        时空裂隙：
-        第6、20格。
-        随机重排该格普通团子的同格顺序。
-        布大王不参与随机重排，仍在最下方。
-
-        use_buwang_path=True：
-        表示当前是布大王行动，机关位移也按布大王逆时针方向处理。
+        推进装置：沿当前行动方向前进1格。
+        阻遏装置：沿当前行动方向后退1格。
+        陆赫斯在推进装置额外前进3格，在阻遏装置额外后退1格。
+        时空裂隙随机重排普通团子同格顺序。
         """
         guard = 0
 
-        while group:
+        while group and not self.race_over:
             guard += 1
 
             if guard > 50:
-                # 防止未来改地图后出现无限循环。
                 break
 
             pos = group[0].pos
@@ -373,15 +375,19 @@ class Race:
                 break
 
             if use_buwang_path:
-                self.move_group_buwang_path(group, delta)
+                if self.move_group_buwang_path(group, delta):
+                    return True
             else:
-                self.move_group_normal_path(group, delta)
+                if self.move_group_normal_path(group, delta):
+                    return True
+
+        return False
 
     def apply_rift(self, pos: int) -> None:
         """
         时空裂隙：
         随机改变该格普通团子的同格顺序。
-        布大王仍然固定为 n=999，保持最下方。
+        布大王不参与随机重排，仍在最下方。
         """
         stack = self.get_cell(pos)
 
@@ -393,13 +399,12 @@ class Race:
 
     def check_feixue_meets_buwang(self) -> None:
         """
-        绯雪与布大王相遇后，获得持续增益：
-        之后绯雪每次自身行动额外前进1格。
+        绯雪与布大王相遇后，获得持续增益。
         """
         if not self.buwang_on_board:
             return
 
-        feixue = next(x for x in self.racers if x.name == "绯雪")
+        feixue = self.name_to_racer["绯雪"]
 
         if feixue.pos == self.buwang.pos:
             feixue.feixue_buff = True
@@ -407,9 +412,7 @@ class Race:
     def check_kati_after_own_move(self, actor: Tuanzi) -> None:
         """
         卡提西娅：
-        每场比赛最多触发1次。
-        自身移动结束后若处于最后一名，
-        本场剩余回合每次自身行动都有60%概率额外前进2格。
+        自身移动结束后若处于最后一名，则触发后续60%概率额外前进2格。
         """
         if actor.name != "卡提西娅":
             return
@@ -423,24 +426,27 @@ class Race:
             actor.kati_triggered = True
             actor.kati_active = True
 
-    def finishers(self) -> list[Tuanzi]:
+    def eligible_finishers(self) -> list[Tuanzi]:
         """
-        终点格中的普通团子。
-        终点格内顺序就是同格顺序 n 从小到大。
+        已经第二次到达32格的普通团子。
+        终点格内仍按同格顺序排列。
         """
-        return [x for x in self.get_cell(FINISH_POS) if not x.is_buwang]
+        return [
+            x for x in self.get_cell(FINISH_POS)
+            if not x.is_buwang and self.arrivals[x.name] >= TARGET_ARRIVALS
+        ]
 
     def activate_buwang_if_needed(self) -> None:
         """
         第3回合开始，布大王加入行动顺序。
         """
-        if self.round_no >= 3 and not self.buwang_on_board:
+        if self.round_no >= BUWANG_START_ROUND and not self.buwang_on_board:
             self.buwang_on_board = True
             self.add_group_to_cell(FINISH_POS, [self.buwang])
 
     def reset_buwang_if_needed(self) -> None:
         """
-        整轮行动结束后：
+        整轮结束后：
         如果布大王不处于同格状态，则传送回终点。
         """
         if not self.buwang_on_board:
@@ -448,7 +454,6 @@ class Race:
 
         stack = self.get_cell(self.buwang.pos)
 
-        # 所在格只有布大王自己，说明不处于同格状态。
         if len(stack) == 1 and stack[0].is_buwang:
             self.remove_group_from_cell(self.buwang.pos, [self.buwang])
             self.add_group_to_cell(FINISH_POS, [self.buwang])
@@ -461,44 +466,44 @@ class Race:
 
             participants = self.racers[:]
 
-            if self.round_no >= 3:
+            if self.round_no >= BUWANG_START_ROUND:
                 participants.append(self.buwang)
 
             order = self.action_order(participants)
 
-            # 西格莉卡第1回合不生成标记，第2回合开始生成。
             if self.round_no >= SIGELIKA_START_ROUND:
                 round_debuff = self.sigelika_targets()
             else:
                 round_debuff = set()
 
             for actor in order:
-                if self.finishers():
+                if self.race_over:
                     break
 
                 steps = self.actor_steps(actor, round_debuff)
                 group = self.moving_group_for_actor(actor)
 
                 if actor.is_buwang:
-                    # 布大王逆时针行动。
-                    self.move_group_buwang_path(group, steps)
-                    self.resolve_devices_chain(group, use_buwang_path=True)
+                    won = self.move_group_buwang_path(group, steps)
+                    if not won:
+                        won = self.resolve_devices_chain(group, use_buwang_path=True)
                 else:
-                    # 普通团子顺时针行动。
-                    self.move_group_normal_path(group, steps)
-                    self.resolve_devices_chain(group, use_buwang_path=False)
+                    won = self.move_group_normal_path(group, steps)
+                    if not won:
+                        won = self.resolve_devices_chain(group, use_buwang_path=False)
 
                 self.check_feixue_meets_buwang()
                 self.check_kati_after_own_move(actor)
 
-                if self.finishers():
-                    return self.finishers(), self.ranking(), self.round_no
+                if won or self.eligible_finishers():
+                    self.race_over = True
+                    return self.eligible_finishers(), self.ranking(), self.round_no
 
-            if self.round_no >= 3:
+            if self.round_no >= BUWANG_START_ROUND:
                 self.reset_buwang_if_needed()
                 self.check_feixue_meets_buwang()
 
-        return self.finishers(), self.ranking(), self.round_no
+        return self.eligible_finishers(), self.ranking(), self.round_no
 
 
 def simulate(n: int, seed: int) -> None:
@@ -515,7 +520,6 @@ def simulate(n: int, seed: int) -> None:
         if finishers:
             champion_count[finishers[0].name] += 1
         else:
-            # 理论兜底：如果超过最大回合仍无人到达终点，则按当前排名第一计冠军。
             champion_count[final_ranking[0].name] += 1
 
         for racer in final_ranking[:4]:
