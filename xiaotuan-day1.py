@@ -4,14 +4,15 @@
 
 当前规则版本：
 1. 棋盘共32格，起点第1格，终点第32格。
-2. 普通团子行动点数为1~3。
-3. 每回合行动顺序随机决定。
-4. 布大王第3回合开始加入行动顺序。
+2. 普通团子顺时针移动：1 -> 2 -> ... -> 32。
+3. 布大王逆时针移动：32 -> 31 -> ... -> 1 -> 32。
+4. 普通团子行动点数为1~3。
 5. 布大王行动点数为1~6。
-6. 布大王移动路径为 32 -> 1 -> 2 -> ... -> 31 -> 32。
-7. 西格莉卡技能从第2回合开始生成标记。
-8. 地图装置支持连锁触发。
-9. 输出夺冠率与晋级率。
+6. 每回合行动顺序随机决定。
+7. 布大王第3回合开始加入行动顺序。
+8. 西格莉卡技能第2回合开始生成标记。
+9. 地图装置支持连锁触发。
+10. 输出夺冠率与晋级率。
 """
 
 from __future__ import annotations
@@ -79,8 +80,8 @@ class Race:
             i: [] for i in range(START_POS, FINISH_POS + 1)
         }
 
-        # 起点不计算同格状态。
-        # 这里虽然放在同一个列表里，但普通团子第一次离开起点时不会带走其他团子。
+        # 所有普通团子从第1格出发。
+        # 第1格初始不计算同格状态，所以第一次从起点行动时不会带走其他团子。
         init_order = self.racers[:]
         self.rng.shuffle(init_order)
         self.cells[START_POS] = init_order
@@ -89,15 +90,15 @@ class Race:
             racer.pos = START_POS
 
     def clamp_normal_pos(self, pos: int) -> int:
+        """
+        普通团子顺时针前进，到达或超过32时停在32。
+        """
         return max(START_POS, min(FINISH_POS, pos))
 
-    def wrap_buwang_pos(self, pos: int) -> int:
+    def wrap_pos(self, pos: int) -> int:
         """
-        布大王环形路径：
-        32 -> 1 -> 2 -> ... -> 31 -> 32
-
-        也就是普通的 1~32 环形坐标。
-        pos 超过32时回到1，pos小于1时回到32。
+        环形坐标换算。
+        1之前是32，32之后是1。
         """
         return ((pos - 1) % BOARD_SIZE) + 1
 
@@ -106,13 +107,13 @@ class Race:
 
     def enforce_buwang_bottom(self, pos: int) -> None:
         """
-        布大王同格顺序固定为 n=999。
+        布大王锁定同格顺序 n=999。
 
         本脚本中：
         stack[0] 表示 n=1，即最上方；
         stack[-1] 表示最下方。
 
-        因此布大王始终放在该格最下方。
+        因此布大王永远放在该格最下方。
         """
         stack = self.get_cell(pos)
         normals = [x for x in stack if not x.is_buwang]
@@ -129,15 +130,13 @@ class Race:
     def add_group_to_cell(self, pos: int, group: list[Tuanzi]) -> None:
         """
         新进入该格的团子放在原有团子上方。
-        即新进入者同格顺序 n 更小。
+        也就是新进入者同格顺序 n 更小。
         """
         old_stack = self.get_cell(pos)
-
         self.cells[pos] = group + old_stack
 
         for x in group:
             x.pos = pos
-
             if not x.is_buwang and pos != START_POS:
                 x.has_left_start = True
 
@@ -145,10 +144,10 @@ class Race:
 
     def move_group_normal_path(self, group: list[Tuanzi], delta: int) -> None:
         """
-        普通团子的移动路径：
-        1 -> 2 -> ... -> 32
+        普通团子的顺时针移动：
+        1 -> 2 -> 3 -> ... -> 32
 
-        到达或超过32时停在32。
+        普通团子不会越过终点，超过32视为到达32。
         """
         if not group or delta == 0:
             return
@@ -161,12 +160,12 @@ class Race:
 
     def move_group_buwang_path(self, group: list[Tuanzi], delta: int) -> None:
         """
-        布大王行动时使用的移动路径：
-        32 -> 1 -> 2 -> ... -> 31 -> 32
+        布大王的逆时针移动：
+        32 -> 31 -> 30 -> ... -> 2 -> 1 -> 32
 
         注意：
-        如果布大王行动时带着其他团子一起移动，
-        被带走的普通团子也跟随布大王走这条环形路径。
+        如果布大王行动时带着普通团子一起移动，
+        被带走的普通团子也跟随布大王沿逆时针方向移动。
         """
         if not group or delta == 0:
             return
@@ -174,7 +173,10 @@ class Race:
         old_pos = group[0].pos
         self.remove_group_from_cell(old_pos, group)
 
-        new_pos = self.wrap_buwang_pos(old_pos + delta)
+        # 布大王“前进”时，格号减少。
+        # delta 为正：逆时针前进。
+        # delta 为负：被阻遏等效果影响时，反向退回。
+        new_pos = self.wrap_pos(old_pos - delta)
         self.add_group_to_cell(new_pos, group)
 
     def moving_group_for_actor(self, actor: Tuanzi) -> list[Tuanzi]:
@@ -188,12 +190,13 @@ class Race:
         如果行动者位于 stack[i]，
         则 stack[:i+1] 跟随行动者一起移动。
 
-        布大王 n=999，始终在最下方。
-        因此布大王行动时，会带着该格所有在它上方的普通团子一起行动。
+        布大王 n=999，始终位于最下方。
+        因此布大王行动时，会带走该格所有普通团子；
+        普通团子行动时，不会带走布大王。
         """
         stack = self.get_cell(actor.pos)
 
-        # 起点第1格初始不计算同格状态。
+        # 起点初始不计算同格状态。
         if (
             not actor.is_buwang
             and actor.pos == START_POS
@@ -209,7 +212,7 @@ class Race:
         普通团子排名：
         1. 位置越靠近终点，排名越高。
         2. 同格时，同格顺序 n 越小，排名越高。
-        3. 布大王不参与普通排名。
+        3. 布大王不参与普通团子排名。
         """
         result: list[Tuanzi] = []
 
@@ -232,27 +235,27 @@ class Race:
         """
         西格莉卡：
         从第2回合开始，标记排名紧邻自身且更高的至多两个团子。
-        被标记团子本回合前进距离 -1，最低为1。
+
+        被标记团子本回合移动距离 -1，最低为1。
         """
         rank = self.ranking()
         sigelika = next(x for x in self.racers if x.name == "西格莉卡")
 
         idx = rank.index(sigelika)
-
         higher = rank[max(0, idx - 2): idx]
 
         return {x.name for x in higher}
 
     def actor_steps(self, actor: Tuanzi, round_debuff: set[str]) -> int:
         """
-        计算行动步数。
+        计算本次行动点数。
 
         普通团子：
         行动点数 1~3。
 
         布大王：
         行动点数 1~6。
-        方向由 move_group_buwang_path 处理。
+        方向不在这里处理，而是在 move_group_buwang_path 中处理。
         """
         if actor.is_buwang:
             return self.rng.randint(BUWANG_DICE_MIN, BUWANG_DICE_MAX)
@@ -277,6 +280,7 @@ class Race:
             if self.rng.random() < 0.50:
                 steps += 1
 
+        # 西格莉卡减速，最低移动距离为1。
         if actor.name in round_debuff:
             steps = max(1, steps - 1)
 
@@ -291,22 +295,22 @@ class Race:
         地图装置连锁触发。
 
         推进装置：
-        第3、11、16、23格
-        普通效果：向前1格。
-        如果移动组中包含陆赫斯，额外向前3格。
+        第3、11、16、23格。
+        普通效果：沿当前行动方向前进1格。
+        如果移动组中包含陆赫斯，则额外前进3格。
 
         阻遏装置：
-        第10、28格
-        普通效果：向后1格。
-        如果移动组中包含陆赫斯，额外向后1格。
+        第10、28格。
+        普通效果：沿当前行动方向后退1格。
+        如果移动组中包含陆赫斯，则额外后退1格。
 
         时空裂隙：
-        第6、20格
+        第6、20格。
         随机重排该格普通团子的同格顺序。
-        布大王不参与随机重排。
+        布大王不参与随机重排，仍在最下方。
 
-        use_buwang_path=True 时：
-        装置造成的位移也按布大王环形路径处理。
+        use_buwang_path=True：
+        表示当前是布大王行动，机关位移也按布大王逆时针方向处理。
         """
         guard = 0
 
@@ -327,13 +331,11 @@ class Race:
 
             if pos in BOOST_CELLS:
                 delta = 1
-
                 if any(x.name == "陆赫斯" for x in group):
                     delta += 3
 
             elif pos in BLOCK_CELLS:
                 delta = -1
-
                 if any(x.name == "陆赫斯" for x in group):
                     delta -= 1
 
@@ -349,7 +351,7 @@ class Race:
         """
         时空裂隙：
         随机改变该格普通团子的同格顺序。
-        布大王仍然固定为 n=999。
+        布大王仍然固定为 n=999，保持最下方。
         """
         stack = self.get_cell(pos)
 
@@ -357,13 +359,12 @@ class Race:
         buwangs = [x for x in stack if x.is_buwang]
 
         self.rng.shuffle(normals)
-
         self.cells[pos] = normals + buwangs
 
     def check_feixue_meets_buwang(self) -> None:
         """
         绯雪与布大王相遇后，获得持续增益：
-        此后绯雪每次自身行动额外前进1格。
+        之后绯雪每次自身行动额外前进1格。
         """
         if not self.buwang_on_board:
             return
@@ -417,6 +418,7 @@ class Race:
 
         stack = self.get_cell(self.buwang.pos)
 
+        # 所在格只有布大王自己，说明不处于同格状态。
         if len(stack) == 1 and stack[0].is_buwang:
             self.remove_group_from_cell(self.buwang.pos, [self.buwang])
             self.add_group_to_cell(FINISH_POS, [self.buwang])
@@ -445,13 +447,14 @@ class Race:
                     break
 
                 steps = self.actor_steps(actor, round_debuff)
-
                 group = self.moving_group_for_actor(actor)
 
                 if actor.is_buwang:
+                    # 布大王逆时针行动。
                     self.move_group_buwang_path(group, steps)
                     self.resolve_devices_chain(group, use_buwang_path=True)
                 else:
+                    # 普通团子顺时针行动。
                     self.move_group_normal_path(group, steps)
                     self.resolve_devices_chain(group, use_buwang_path=False)
 
@@ -482,6 +485,7 @@ def simulate(n: int, seed: int) -> None:
         if finishers:
             champion_count[finishers[0].name] += 1
         else:
+            # 理论兜底：如果超过最大回合仍无人到达终点，则按当前排名第一计冠军。
             champion_count[final_ranking[0].name] += 1
 
         for racer in final_ranking[:4]:
